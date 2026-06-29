@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        arch: [amd64, arm64]
+        exclude:
+          - os: windows-latest
+            arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Copy static files
+        run: |
+          mkdir -p cmd/server/static
+          cp frontend/src/index.html cmd/server/static/
+          cp frontend/src/app.js cmd/server/static/
+
+      - name: Build for Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          GOOS=linux GOARCH=${{ matrix.arch }} go build -o dbsync-${{ matrix.arch }} ./cmd/server/main.go
+          tar -czf dbsync-linux-${{ matrix.arch }}.tar.gz dbsync-${{ matrix.arch }}
+
+      - name: Build for macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          GOOS=darwin GOARCH=${{ matrix.arch }} go build -o dbsync-${{ matrix.arch }} ./cmd/server/main.go
+          tar -czf dbsync-darwin-${{ matrix.arch }}.tar.gz dbsync-${{ matrix.arch }}
+
+      - name: Build for Windows
+        if: matrix.os == 'windows-latest'
+        run: |
+          GOOS=windows GOARCH=${{ matrix.arch }} go build -o dbsync-${{ matrix.arch }}.exe ./cmd/server/main.go
+          powershell -Command "Compress-Archive -Path dbsync-${{ matrix.arch }}.exe -DestinationPath dbsync-windows-${{ matrix.arch }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbsync-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            *.zip
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: List downloaded files
+        run: ls -la
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dbsync-ubuntu-latest-amd64/dbsync-linux-amd64.tar.gz
+            dbsync-ubuntu-latest-arm64/dbsync-linux-arm64.tar.gz
+            dbsync-macos-latest-amd64/dbsync-darwin-amd64.tar.gz
+            dbsync-macos-latest-arm64/dbsync-darwin-arm64.tar.gz
+            dbsync-windows-latest-amd64/dbsync-windows-amd64.zip
+          generate_release_notes: true
