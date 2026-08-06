@@ -66,15 +66,18 @@ func main() {
 
 	schemaHandler := handlers.NewSchemaHandler(db)
 	apiWithAuth.HandleFunc("/schema/compare", schemaHandler.CompareSchemas).Methods("POST")
-	apiWithAuth.HandleFunc("/schema/sync", schemaHandler.SyncSchema).Methods("POST")
+	apiWithAuth.HandleFunc("/schema/compare/stream", schemaHandler.CompareSchemasStream).Methods("POST")
+	apiWithAuth.HandleFunc("/schema/execute", schemaHandler.ExecuteSchemaSQL).Methods("POST")
 	apiWithAuth.HandleFunc("/schema/tables/{config_id}", schemaHandler.GetTables).Methods("GET")
 
 	apiWithAuth.HandleFunc("/datasync/sync", dataSyncHandler.SyncData).Methods("POST")
+	apiWithAuth.HandleFunc("/datasync/sync/stream", dataSyncHandler.SyncDataStream).Methods("POST")
 	apiWithAuth.HandleFunc("/datasync/preview/{config_id}/{table_name}", dataSyncHandler.GetTablePreview).Methods("GET")
 	apiWithAuth.HandleFunc("/datasync/count/{config_id}/{table_name}", dataSyncHandler.GetTableCount).Methods("GET")
 
 	auditHandler := handlers.NewAuditHandler(db)
 	apiWithAuth.HandleFunc("/audit/logs", auditHandler.GetLogs).Methods("GET")
+	apiWithAuth.HandleFunc("/audit/apply/{id}", auditHandler.ApplySQL).Methods("POST")
 
 	fileServer := http.FileServer(http.FS(staticFS))
 

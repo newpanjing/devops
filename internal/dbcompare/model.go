@@ -3,6 +3,7 @@ package dbcompare
 type Column struct {
 	Name          string `json:"name"`
 	Type          string `json:"type"`
+	Comment       string `json:"comment"`
 	Nullable      bool   `json:"nullable"`
 	DefaultValue  string `json:"default_value"`
 	PrimaryKey    bool   `json:"primary_key"`
@@ -10,23 +11,24 @@ type Column struct {
 }
 
 type Index struct {
-	Name      string   `json:"name"`
-	Unique    bool     `json:"unique"`
-	Column    string   `json:"column"`
-	Columns   []string `json:"columns"`
+	Name    string   `json:"name"`
+	Unique  bool     `json:"unique"`
+	Column  string   `json:"column"`
+	Columns []string `json:"columns"`
 }
 
 type ForeignKey struct {
-	Name             string `json:"name"`
-	FromColumn       string `json:"from_column"`
-	ToTable          string `json:"to_table"`
-	ToColumn         string `json:"to_column"`
-	OnDelete         string `json:"on_delete"`
-	OnUpdate         string `json:"on_update"`
+	Name       string `json:"name"`
+	FromColumn string `json:"from_column"`
+	ToTable    string `json:"to_table"`
+	ToColumn   string `json:"to_column"`
+	OnDelete   string `json:"on_delete"`
+	OnUpdate   string `json:"on_update"`
 }
 
 type Table struct {
 	Name        string       `json:"name"`
+	Comment     string       `json:"comment"`
 	Columns     []Column     `json:"columns"`
 	Indexes     []Index      `json:"indexes"`
 	ForeignKeys []ForeignKey `json:"foreign_keys"`
@@ -45,18 +47,19 @@ const (
 )
 
 type ColumnDiff struct {
-	Type          DiffType `json:"type"`
-	ColumnName    string   `json:"column_name"`
-	SourceColumn  *Column  `json:"source_column"`
-	TargetColumn  *Column  `json:"target_column"`
+	Type         DiffType `json:"type"`
+	ColumnName   string   `json:"column_name"`
+	SourceColumn *Column  `json:"source_column"`
+	TargetColumn *Column  `json:"target_column"`
 }
 
 type TableDiff struct {
-	Type          DiffType   `json:"type"`
-	TableName     string     `json:"table_name"`
-	SourceTable   *Table     `json:"source_table"`
-	TargetTable   *Table     `json:"target_table"`
-	ColumnDiffs   []ColumnDiff `json:"column_diffs"`
+	Type                DiffType     `json:"type"`
+	TableName           string       `json:"table_name"`
+	SourceTable         *Table       `json:"source_table"`
+	TargetTable         *Table       `json:"target_table"`
+	TableCommentChanged bool         `json:"table_comment_changed"`
+	ColumnDiffs         []ColumnDiff `json:"column_diffs"`
 }
 
 type SchemaDiff struct {

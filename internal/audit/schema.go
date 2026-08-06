@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     source_db TEXT,
     target_db TEXT,
     details TEXT,
+    sql TEXT,
+    applied INTEGER DEFAULT 0,
     status TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)

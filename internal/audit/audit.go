@@ -15,6 +15,8 @@ type AuditLog struct {
 	SourceDB   string    `json:"source_db"`
 	TargetDB   string    `json:"target_db"`
 	Details    string    `json:"details"`
+	SQL        string    `json:"sql"`
+	Applied    int       `json:"applied"`
 	Status     string    `json:"status"`
 	CreatedAt  time.Time `json:"created_at"`
 }
@@ -30,11 +32,11 @@ type DBConfig struct {
 	Password string `json:"password"`
 }
 
-func LogAction(db *sql.DB, userID int, action, targetType, targetName, sourceDB, targetDB, details, status string) error {
+func LogAction(db *sql.DB, userID int, action, targetType, targetName, sourceDB, targetDB, details, sql, status string) error {
 	_, err := db.Exec(`
-		INSERT INTO audit_logs (user_id, action, target_type, target_name, source_db, target_db, details, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, userID, action, targetType, targetName, sourceDB, targetDB, details, status)
+		INSERT INTO audit_logs (user_id, action, target_type, target_name, source_db, target_db, details, sql, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, userID, action, targetType, targetName, sourceDB, targetDB, details, sql, status)
 	if err != nil {
 		return fmt.Errorf("failed to log action: %w", err)
 	}
@@ -43,7 +45,7 @@ func LogAction(db *sql.DB, userID int, action, targetType, targetName, sourceDB,
 
 func GetLogs(db *sql.DB, limit, offset int) ([]AuditLog, error) {
 	rows, err := db.Query(`
-		SELECT id, user_id, action, target_type, target_name, source_db, target_db, details, status, created_at
+		SELECT id, user_id, action, target_type, target_name, source_db, target_db, details, sql, applied, status, created_at
 		FROM audit_logs
 		ORDER BY created_at DESC
 		LIMIT ? OFFSET ?
@@ -65,6 +67,8 @@ func GetLogs(db *sql.DB, limit, offset int) ([]AuditLog, error) {
 			&log.SourceDB,
 			&log.TargetDB,
 			&log.Details,
+			&log.SQL,
+			&log.Applied,
 			&log.Status,
 			&log.CreatedAt,
 		); err != nil {
@@ -148,6 +152,43 @@ func DeleteDBConfig(db *sql.DB, id int) error {
 	_, err := db.Exec(`DELETE FROM db_configs WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete db config: %w", err)
+	}
+	return nil
+}
+
+func GetLogByID(db *sql.DB, id int) (*AuditLog, error) {
+	var log AuditLog
+	err := db.QueryRow(`
+		SELECT id, user_id, action, target_type, target_name, source_db, target_db, details, sql, applied, status, created_at
+		FROM audit_logs
+		WHERE id = ?
+	`, id).Scan(
+		&log.ID,
+		&log.UserID,
+		&log.Action,
+		&log.TargetType,
+		&log.TargetName,
+		&log.SourceDB,
+		&log.TargetDB,
+		&log.Details,
+		&log.SQL,
+		&log.Applied,
+		&log.Status,
+		&log.CreatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get log: %w", err)
+	}
+	return &log, nil
+}
+
+func UpdateLogApplied(db *sql.DB, id int, applied int) error {
+	_, err := db.Exec(`UPDATE audit_logs SET applied = ? WHERE id = ?`, applied, id)
+	if err != nil {
+		return fmt.Errorf("failed to update log: %w", err)
 	}
 	return nil
 }

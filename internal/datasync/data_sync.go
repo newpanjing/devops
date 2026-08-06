@@ -8,22 +8,36 @@ import (
 )
 
 type SyncResult struct {
-	Table      string `json:"table"`
-	Inserted   int    `json:"inserted"`
-	Updated    int    `json:"updated"`
-	Deleted    int    `json:"deleted"`
-	Total      int    `json:"total"`
-	Error      string `json:"error,omitempty"`
+	Table    string   `json:"table"`
+	Inserted int      `json:"inserted"`
+	Updated  int      `json:"updated"`
+	Deleted  int      `json:"deleted"`
+	Total    int      `json:"total"`
+	Error    string   `json:"error,omitempty"`
+	SQL      []string `json:"sql"`
 }
 
-func SyncTableData(source, target *dbcompare.DBConnection, tableName string, deleteMissing bool) (*SyncResult, error) {
+type DataSyncProgress struct {
+	TableName string
+	Message   string
+}
+
+type DataSyncProgressFunc func(progress DataSyncProgress)
+
+func PreviewTableData(source, target *dbcompare.DBConnection, tableName string, deleteMissing bool) (*SyncResult, error) {
+	return PreviewTableDataWithProgress(source, target, tableName, deleteMissing, nil)
+}
+
+func PreviewTableDataWithProgress(source, target *dbcompare.DBConnection, tableName string, deleteMissing bool, progressFunc DataSyncProgressFunc) (*SyncResult, error) {
 	result := &SyncResult{Table: tableName}
 
+	notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: "正在读取源表结构"})
 	sourceSchema, err := source.ReadSchema()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read source schema: %w", err)
 	}
 
+	notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: "正在读取目标表结构"})
 	targetSchema, err := target.ReadSchema()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read target schema: %w", err)
@@ -55,17 +69,23 @@ func SyncTableData(source, target *dbcompare.DBConnection, tableName string, del
 		return nil, fmt.Errorf("table %s has no primary key", tableName)
 	}
 
+	notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: "正在读取源表数据"})
 	sourceData, err := readTableData(source, sourceTable)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read source data: %w", err)
 	}
 
+	notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: "正在读取目标表数据"})
 	targetData, err := readTableData(target, targetTable)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read target data: %w", err)
 	}
 
 	result.Total = len(sourceData)
+	notifyDataSyncProgress(progressFunc, DataSyncProgress{
+		TableName: tableName,
+		Message:   fmt.Sprintf("源表 %d 行，目标表 %d 行，正在按主键比对", len(sourceData), len(targetData)),
+	})
 
 	sourcePKMap := buildPKMap(sourceData, pkColumns)
 	targetPKMap := buildPKMap(targetData, pkColumns)
@@ -73,30 +93,41 @@ func SyncTableData(source, target *dbcompare.DBConnection, tableName string, del
 	for pk, sourceRow := range sourcePKMap {
 		if targetRow, ok := targetPKMap[pk]; ok {
 			if !rowsEqual(sourceRow, targetRow) {
-				if err := updateRow(target, targetTable, sourceRow, pkColumns); err != nil {
-					return nil, fmt.Errorf("failed to update row: %w", err)
-				}
+				sql := buildUpdateSQL(targetTable, sourceRow, pkColumns)
+				result.SQL = append(result.SQL, sql)
 				result.Updated++
+				notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现修改记录，主键: %s", pk)})
 			}
 			delete(targetPKMap, pk)
 		} else {
-			if err := insertRow(target, targetTable, sourceRow); err != nil {
-				return nil, fmt.Errorf("failed to insert row: %w", err)
-			}
+			sql := buildInsertSQL(targetTable, sourceRow)
+			result.SQL = append(result.SQL, sql)
 			result.Inserted++
+			notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现新增记录，主键: %s", pk)})
 		}
 	}
 
 	if deleteMissing {
 		for pk := range targetPKMap {
-			if err := deleteRow(target, targetTable, pk, pkColumns); err != nil {
-				return nil, fmt.Errorf("failed to delete row: %w", err)
-			}
+			sql := buildDeleteSQL(targetTable, pk, pkColumns)
+			result.SQL = append(result.SQL, sql)
 			result.Deleted++
+			notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现删除记录，主键: %s", pk)})
 		}
 	}
 
+	notifyDataSyncProgress(progressFunc, DataSyncProgress{
+		TableName: tableName,
+		Message:   fmt.Sprintf("表比对完成，新增 %d，修改 %d，删除 %d", result.Inserted, result.Updated, result.Deleted),
+	})
+
 	return result, nil
+}
+
+func notifyDataSyncProgress(progressFunc DataSyncProgressFunc, progress DataSyncProgress) {
+	if progressFunc != nil {
+		progressFunc(progress)
+	}
 }
 
 func getPrimaryKeyColumns(table *dbcompare.Table) []string {
@@ -194,97 +225,6 @@ func valuesEqual(a, b interface{}) bool {
 	}
 }
 
-func insertRow(db *dbcompare.DBConnection, table *dbcompare.Table, row map[string]interface{}) error {
-	var cols []string
-	var placeholders []string
-	var values []interface{}
-
-	for _, col := range table.Columns {
-		if col.AutoIncrement {
-			continue
-		}
-		cols = append(cols, fmt.Sprintf("`%s`", col.Name))
-		placeholders = append(placeholders, "?")
-		values = append(values, row[col.Name])
-	}
-
-	sql := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)", table.Name, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-	_, err := db.DB.Exec(sql, values...)
-	if err != nil {
-		return fmt.Errorf("failed to insert: %w", err)
-	}
-
-	return nil
-}
-
-func updateRow(db *dbcompare.DBConnection, table *dbcompare.Table, row map[string]interface{}, pkColumns []string) error {
-	var setClauses []string
-	var values []interface{}
-
-	for _, col := range table.Columns {
-		if col.PrimaryKey || col.AutoIncrement {
-			continue
-		}
-		setClauses = append(setClauses, fmt.Sprintf("`%s` = ?", col.Name))
-		values = append(values, row[col.Name])
-	}
-
-	var whereClauses []string
-	for _, pkCol := range pkColumns {
-		whereClauses = append(whereClauses, fmt.Sprintf("`%s` = ?", pkCol))
-		values = append(values, row[pkCol])
-	}
-
-	sql := fmt.Sprintf("UPDATE `%s` SET %s WHERE %s", table.Name, strings.Join(setClauses, ", "), strings.Join(whereClauses, " AND "))
-	_, err := db.DB.Exec(sql, values...)
-	if err != nil {
-		return fmt.Errorf("failed to update: %w", err)
-	}
-
-	return nil
-}
-
-func deleteRow(db *dbcompare.DBConnection, table *dbcompare.Table, pk string, pkColumns []string) error {
-	pkParts := strings.Split(pk, "|")
-	var whereClauses []string
-	var values []interface{}
-
-	for i, pkCol := range pkColumns {
-		whereClauses = append(whereClauses, fmt.Sprintf("`%s` = ?", pkCol))
-		values = append(values, pkParts[i])
-	}
-
-	sql := fmt.Sprintf("DELETE FROM `%s` WHERE %s", table.Name, strings.Join(whereClauses, " AND "))
-	_, err := db.DB.Exec(sql, values...)
-	if err != nil {
-		return fmt.Errorf("failed to delete: %w", err)
-	}
-
-	return nil
-}
-
-func SyncAllTables(source, target *dbcompare.DBConnection, deleteMissing bool) ([]*SyncResult, error) {
-	sourceSchema, err := source.ReadSchema()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read source schema: %w", err)
-	}
-
-	var results []*SyncResult
-	for _, table := range sourceSchema.Tables {
-		result, err := SyncTableData(source, target, table.Name, deleteMissing)
-		if err != nil {
-			results = append(results, &SyncResult{
-				Table: table.Name,
-				Error: err.Error(),
-			})
-		} else {
-			results = append(results, result)
-		}
-	}
-
-	return results, nil
-}
-
 func CountTableRows(db *dbcompare.DBConnection, tableName string) (int, error) {
 	var count int
 	err := db.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`", tableName)).Scan(&count)
@@ -380,4 +320,77 @@ func GetTableList(db *dbcompare.DBConnection) ([]string, error) {
 		tables = append(tables, table.Name)
 	}
 	return tables, nil
+}
+
+func buildInsertSQL(table *dbcompare.Table, row map[string]interface{}) string {
+	var cols []string
+	var values []string
+
+	for _, col := range table.Columns {
+		if col.AutoIncrement {
+			continue
+		}
+		cols = append(cols, fmt.Sprintf("`%s`", col.Name))
+		values = append(values, formatSQLValue(row[col.Name]))
+	}
+
+	return fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s);", table.Name, strings.Join(cols, ", "), strings.Join(values, ", "))
+}
+
+func buildUpdateSQL(table *dbcompare.Table, row map[string]interface{}, pkColumns []string) string {
+	var setClauses []string
+	var whereClauses []string
+
+	for _, col := range table.Columns {
+		if col.PrimaryKey || col.AutoIncrement {
+			continue
+		}
+		setClauses = append(setClauses, fmt.Sprintf("`%s` = %s", col.Name, formatSQLValue(row[col.Name])))
+	}
+
+	for _, pkCol := range pkColumns {
+		whereClauses = append(whereClauses, fmt.Sprintf("`%s` = %s", pkCol, formatSQLValue(row[pkCol])))
+	}
+
+	return fmt.Sprintf("UPDATE `%s` SET %s WHERE %s;", table.Name, strings.Join(setClauses, ", "), strings.Join(whereClauses, " AND "))
+}
+
+func buildDeleteSQL(table *dbcompare.Table, pk string, pkColumns []string) string {
+	pkParts := strings.Split(pk, "|")
+	var whereClauses []string
+
+	for i, pkCol := range pkColumns {
+		whereClauses = append(whereClauses, fmt.Sprintf("`%s` = %s", pkCol, formatSQLValue(pkParts[i])))
+	}
+
+	return fmt.Sprintf("DELETE FROM `%s` WHERE %s;", table.Name, strings.Join(whereClauses, " AND "))
+}
+
+func formatSQLValue(v interface{}) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch val := v.(type) {
+	case []byte:
+		return fmt.Sprintf("'%s'", escapeSQL(string(val)))
+	case string:
+		return fmt.Sprintf("'%s'", escapeSQL(val))
+	case int, int64, int32, int16, int8:
+		return fmt.Sprintf("%d", val)
+	case uint, uint64, uint32, uint16, uint8:
+		return fmt.Sprintf("%d", val)
+	case float64, float32:
+		return fmt.Sprintf("%v", val)
+	case bool:
+		if val {
+			return "1"
+		}
+		return "0"
+	default:
+		return fmt.Sprintf("'%s'", escapeSQL(fmt.Sprintf("%v", val)))
+	}
+}
+
+func escapeSQL(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\\", "\\\\"), "'", "\\'")
 }

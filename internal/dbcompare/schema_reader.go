@@ -59,8 +59,14 @@ func (dc *DBConnection) readMySQLTable(tableName string) (Table, error) {
 		return Table{}, err
 	}
 
+	tableComment, err := dc.readMySQLTableComment(tableName)
+	if err != nil {
+		return Table{}, err
+	}
+
 	return Table{
 		Name:        tableName,
+		Comment:     tableComment,
 		Columns:     columns,
 		Indexes:     indexes,
 		ForeignKeys: foreignKeys,
@@ -68,7 +74,12 @@ func (dc *DBConnection) readMySQLTable(tableName string) (Table, error) {
 }
 
 func (dc *DBConnection) readMySQLColumns(tableName string) ([]Column, error) {
-	rows, err := dc.DB.Query(fmt.Sprintf("SHOW COLUMNS FROM `%s`", tableName))
+	rows, err := dc.DB.Query(`
+		SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA, COLUMN_COMMENT
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+		ORDER BY ORDINAL_POSITION
+	`, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %w", err)
 	}
@@ -76,9 +87,9 @@ func (dc *DBConnection) readMySQLColumns(tableName string) ([]Column, error) {
 
 	var columns []Column
 	for rows.Next() {
-		var name, colType, null, key, extra string
+		var name, colType, null, key, extra, comment string
 		var defaultValue sql.NullString
-		if err := rows.Scan(&name, &colType, &null, &key, &defaultValue, &extra); err != nil {
+		if err := rows.Scan(&name, &colType, &null, &defaultValue, &key, &extra, &comment); err != nil {
 			return nil, fmt.Errorf("failed to scan column: %w", err)
 		}
 
@@ -90,6 +101,7 @@ func (dc *DBConnection) readMySQLColumns(tableName string) ([]Column, error) {
 		columns = append(columns, Column{
 			Name:          name,
 			Type:          colType,
+			Comment:       comment,
 			Nullable:      null == "YES",
 			DefaultValue:  defaultVal,
 			PrimaryKey:    key == "PRI",
@@ -98,6 +110,22 @@ func (dc *DBConnection) readMySQLColumns(tableName string) ([]Column, error) {
 	}
 
 	return columns, nil
+}
+
+func (dc *DBConnection) readMySQLTableComment(tableName string) (string, error) {
+	var comment sql.NullString
+	err := dc.DB.QueryRow(`
+		SELECT TABLE_COMMENT
+		FROM INFORMATION_SCHEMA.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+	`, tableName).Scan(&comment)
+	if err != nil {
+		return "", fmt.Errorf("failed to get table comment: %w", err)
+	}
+	if !comment.Valid {
+		return "", nil
+	}
+	return comment.String, nil
 }
 
 func (dc *DBConnection) readMySQLIndexes(tableName string) ([]Index, error) {
@@ -109,19 +137,19 @@ func (dc *DBConnection) readMySQLIndexes(tableName string) ([]Index, error) {
 
 	indexMap := make(map[string]*Index)
 	for rows.Next() {
-		var table, nonUnique, keyName, seqInIndex, columnName, indexType string
-		if err := rows.Scan(&table, &nonUnique, &keyName, &seqInIndex, &columnName, &indexType); err != nil {
+		var table, nonUnique, keyName, seqInIndex, columnName, collation, cardinality, subPart, packed, null, indexType, comment, indexComment, visible, expression sql.NullString
+		if err := rows.Scan(&table, &nonUnique, &keyName, &seqInIndex, &columnName, &collation, &cardinality, &subPart, &packed, &null, &indexType, &comment, &indexComment, &visible, &expression); err != nil {
 			return nil, fmt.Errorf("failed to scan index: %w", err)
 		}
 
-		if _, ok := indexMap[keyName]; !ok {
-			indexMap[keyName] = &Index{
-				Name:    keyName,
-				Unique:  nonUnique == "0",
+		if _, ok := indexMap[keyName.String]; !ok {
+			indexMap[keyName.String] = &Index{
+				Name:    keyName.String,
+				Unique:  nonUnique.String == "0",
 				Columns: []string{},
 			}
 		}
-		indexMap[keyName].Columns = append(indexMap[keyName].Columns, columnName)
+		indexMap[keyName.String].Columns = append(indexMap[keyName.String].Columns, columnName.String)
 	}
 
 	var indexes []Index
@@ -134,9 +162,12 @@ func (dc *DBConnection) readMySQLIndexes(tableName string) ([]Index, error) {
 
 func (dc *DBConnection) readMySQLForeignKeys(tableName string) ([]ForeignKey, error) {
 	rows, err := dc.DB.Query(`
-		SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, DELETE_RULE, UPDATE_RULE
-		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL
+		SELECT kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME,
+		       rc.DELETE_RULE, rc.UPDATE_RULE
+		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+		LEFT JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+			ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
+		WHERE kcu.TABLE_SCHEMA = DATABASE() AND kcu.TABLE_NAME = ? AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
 	`, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get foreign keys: %w", err)
@@ -145,18 +176,18 @@ func (dc *DBConnection) readMySQLForeignKeys(tableName string) ([]ForeignKey, er
 
 	var foreignKeys []ForeignKey
 	for rows.Next() {
-		var name, fromCol, toTable, toCol, onDelete, onUpdate string
+		var name, fromCol, toTable, toCol, onDelete, onUpdate sql.NullString
 		if err := rows.Scan(&name, &fromCol, &toTable, &toCol, &onDelete, &onUpdate); err != nil {
 			return nil, fmt.Errorf("failed to scan foreign key: %w", err)
 		}
 
 		foreignKeys = append(foreignKeys, ForeignKey{
-			Name:       name,
-			FromColumn: fromCol,
-			ToTable:    toTable,
-			ToColumn:   toCol,
-			OnDelete:   onDelete,
-			OnUpdate:   onUpdate,
+			Name:       name.String,
+			FromColumn: fromCol.String,
+			ToTable:    toTable.String,
+			ToColumn:   toCol.String,
+			OnDelete:   onDelete.String,
+			OnUpdate:   onUpdate.String,
 		})
 	}
 
