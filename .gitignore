@@ -17,9 +17,8 @@ tmp/
 temp/
 *.tmp
 
-# 静态文件 (构建时复制)
+# 静态文件 (嵌入到二进制)
 static/
-cmd/server/static/
 
 # 编译产物
 *.o
