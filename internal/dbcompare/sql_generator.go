@@ -123,7 +123,7 @@ func generateColumnDefinition(column *Column, dbType string) string {
 		}
 	}
 	if column.DefaultValue != "" {
-		definition += fmt.Sprintf(" DEFAULT %s", column.DefaultValue)
+		definition += fmt.Sprintf(" DEFAULT %s", quoteDefaultValue(column.DefaultValue, column.Type))
 	}
 	if dbType == sqlDatabaseTypeMySQL && column.Comment != "" {
 		definition += fmt.Sprintf(" COMMENT %s", quoteStringLiteral(column.Comment))
@@ -138,6 +138,88 @@ func quoteIdentifier(identifier string) string {
 
 func quoteStringLiteral(value string) string {
 	return fmt.Sprintf("'%s'", strings.ReplaceAll(strings.ReplaceAll(value, "\\", "\\\\"), "'", "''"))
+}
+
+// quoteDefaultValue wraps string-type default values in single quotes if not already quoted.
+// Numeric values, SQL functions/expressions, and already-quoted values are returned as-is.
+func quoteDefaultValue(defaultValue, colType string) string {
+	val := strings.TrimSpace(defaultValue)
+	if val == "" || val == "NULL" || val == "null" {
+		return val
+	}
+
+	// Already quoted (PostgreSQL returns 'value'::text style)
+	if strings.HasPrefix(val, "'") {
+		return val
+	}
+
+	// SQL functions / expressions that should not be quoted
+	upperVal := strings.ToUpper(val)
+	sqlFunctions := []string{
+		"CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
+		"NOW()", "CURRENT_TIMESTAMP()", "UTC_TIMESTAMP", "UTC_TIMESTAMP()",
+		"UNIX_TIMESTAMP", "UNIX_TIMESTAMP()", "UUID()", "RAND()",
+		"CURRENT_USER", "CURRENT_USER()", "SESSION_USER", "USER()",
+		"TRUE", "FALSE", "true", "false",
+	}
+	for _, fn := range sqlFunctions {
+		if upperVal == fn || val == fn {
+			return val
+		}
+	}
+
+	// PostgreSQL expressions like nextval('seq_name'::regclass)
+	if strings.Contains(val, "(") && strings.Contains(val, ")") {
+		return val
+	}
+
+	// Numeric values (int, float, decimal, including negative)
+	if isNumeric(val) {
+		return val
+	}
+
+	// String types need quoting
+	colTypeLower := strings.ToLower(colType)
+	stringTypes := []string{
+		"char", "varchar", "text", "enum", "set", "json",
+		"tinytext", "mediumtext", "longtext", "blob",
+		"tinyblob", "mediumblob", "longblob", "binary", "varbinary",
+	}
+	for _, st := range stringTypes {
+		if strings.Contains(colTypeLower, st) {
+			return quoteStringLiteral(val)
+		}
+	}
+
+	// Default: if not numeric and not a known function, treat as string
+	return quoteStringLiteral(val)
+}
+
+// isNumeric checks if a string represents a numeric value (int, float, decimal).
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Allow leading negative sign
+	if s[0] == '-' || s[0] == '+' {
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+	hasDigit := false
+	hasDot := false
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c == '.' && !hasDot:
+			hasDot = true
+		default:
+			return false
+		}
+	}
+	return hasDigit
 }
 
 func generateAlterTableCommentSQL(table *Table, dbType string) string {

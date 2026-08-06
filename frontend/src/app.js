@@ -506,6 +506,20 @@ async function loadDBConfigs() {
     }
 }
 
+function updateTargetOptions(sourceSelectId, targetSelectId) {
+    const sourceSelect = document.getElementById(sourceSelectId);
+    const targetSelect = document.getElementById(targetSelectId);
+    if (!sourceSelect || !targetSelect) return;
+    
+    const sourceId = sourceSelect.value;
+    const selectedTargets = Array.from(targetSelect.selectedOptions).map(o => o.value);
+    
+    targetSelect.innerHTML = dbConfigs
+        .filter(c => String(c.id) !== sourceId)
+        .map(c => `<option value="${c.id}" ${selectedTargets.includes(String(c.id)) ? 'selected' : ''}>${c.name}</option>`)
+        .join('');
+}
+
 async function renderSchemaCompare(content) {
     await loadDBConfigs();
     content.innerHTML = `
@@ -537,6 +551,10 @@ async function renderSchemaCompare(content) {
         </div>
         <div id="schemaDiffResult"></div>
     `;
+    
+    document.getElementById('sourceConfig').addEventListener('change', () => {
+        updateTargetOptions('sourceConfig', 'targetConfigs');
+    });
 }
 
 async function compareSchemas() {
@@ -894,7 +912,7 @@ function showSchemaSQLDialog(resultIndex) {
     const modal = document.createElement('div');
     modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
     modal.innerHTML = `
-        <div class="bg-white rounded-xl shadow-xl w-full max-w-4xl max-h-[85vh] overflow-hidden">
+        <div class="bg-white rounded-xl shadow-xl w-full max-w-5xl max-h-[85vh] overflow-hidden">
             <div class="flex justify-between items-center p-4 border-b">
                 <h3 class="text-lg font-semibold">表结构比对 - ${result.target_name}</h3>
                 <button id="schemaCancelBtn" class="bg-gray-200 text-gray-700 px-4 py-1.5 rounded-lg text-sm hover:bg-gray-300 transition">
@@ -902,7 +920,7 @@ function showSchemaSQLDialog(resultIndex) {
                 </button>
             </div>
             <div class="p-4 overflow-auto max-h-[65vh]">
-                <pre class="bg-gray-100 p-4 rounded-lg overflow-x-auto text-sm text-gray-800">${escapeHtml(sqlContent)}</pre>
+                <pre class="rounded-lg overflow-x-auto text-sm"><code id="schemaSqlCode" class="language-sql">${escapeHtml(sqlContent)}</code></pre>
             </div>
             <div class="p-4 border-t bg-gray-50 flex justify-end gap-3">
                 <button id="schemaDownloadBtn" class="bg-blue-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-blue-700 transition flex items-center">
@@ -915,6 +933,11 @@ function showSchemaSQLDialog(resultIndex) {
         </div>
     `;
     document.body.appendChild(modal);
+
+    // Highlight SQL syntax
+    if (window.hljs) {
+        window.hljs.highlightElement(document.getElementById('schemaSqlCode'));
+    }
 
     document.getElementById('schemaCancelBtn').addEventListener('click', () => {
         modal.remove();
@@ -975,7 +998,7 @@ async function renderDataSync(content) {
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div>
                     <label class="block text-sm font-medium text-gray-700 mb-2">源数据库</label>
-                    <select id="dataSourceConfig" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none" onchange="loadSourceTables()">
+                    <select id="dataSourceConfig" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none">
                         <option value="">请选择源数据库</option>
                         ${dbConfigs.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
                     </select>
@@ -1006,6 +1029,11 @@ async function renderDataSync(content) {
         </div>
         <div id="dataSyncResult"></div>
     `;
+    
+    document.getElementById('dataSourceConfig').addEventListener('change', () => {
+        updateTargetOptions('dataSourceConfig', 'dataTargetConfigs');
+        loadSourceTables();
+    });
 }
 
 async function loadSourceTables() {
@@ -1380,7 +1408,7 @@ function showDataSQLDialog(resultIndex) {
     const modal = document.createElement('div');
     modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
     modal.innerHTML = `
-        <div class="bg-white rounded-xl shadow-xl w-full max-w-4xl max-h-[85vh] overflow-hidden">
+        <div class="bg-white rounded-xl shadow-xl w-full max-w-5xl max-h-[85vh] overflow-hidden">
             <div class="flex justify-between items-center p-4 border-b">
                 <h3 class="text-lg font-semibold">数据同步 - ${result.target_name}</h3>
                 <button id="dataCancelBtn" class="bg-gray-200 text-gray-700 px-4 py-1.5 rounded-lg text-sm hover:bg-gray-300 transition">
@@ -1388,7 +1416,7 @@ function showDataSQLDialog(resultIndex) {
                 </button>
             </div>
             <div class="p-4 overflow-auto max-h-[65vh]">
-                <pre class="bg-gray-100 p-4 rounded-lg overflow-x-auto text-sm text-gray-800">${escapeHtml(sqlContent)}</pre>
+                <pre class="rounded-lg overflow-x-auto text-sm"><code id="dataSqlCode" class="language-sql">${escapeHtml(sqlContent)}</code></pre>
             </div>
             <div class="p-4 border-t bg-gray-50 flex justify-end gap-3">
                 <button id="dataDownloadBtn" class="bg-blue-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-blue-700 transition flex items-center">
@@ -1398,6 +1426,11 @@ function showDataSQLDialog(resultIndex) {
         </div>
     `;
     document.body.appendChild(modal);
+
+    // Highlight SQL syntax
+    if (window.hljs) {
+        window.hljs.highlightElement(document.getElementById('dataSqlCode'));
+    }
 
     document.getElementById('dataCancelBtn').addEventListener('click', () => {
         modal.remove();
@@ -1448,26 +1481,35 @@ function showTableSQL(targetIndex, tableIndex) {
     const modal = document.createElement('div');
     modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
     modal.innerHTML = `
-        <div class="bg-white rounded-xl shadow-xl w-full max-w-4xl max-h-[80vh] overflow-hidden">
+        <div class="bg-white rounded-xl shadow-xl w-full max-w-5xl max-h-[85vh] overflow-hidden">
             <div class="flex justify-between items-center p-4 border-b">
                 <h3 class="text-lg font-semibold">${result.table} - SQL语句</h3>
                 <div class="flex gap-2">
                     <button id="tableDownloadBtn" class="bg-blue-600 text-white px-4 py-1.5 rounded-lg text-sm hover:bg-blue-700 transition">
                         <i class="fa fa-download mr-1"></i>下载SQL
                     </button>
-                    <button onclick="this.closest('.fixed').remove()" class="bg-gray-200 text-gray-700 px-4 py-1.5 rounded-lg text-sm hover:bg-gray-300 transition">
+                    <button id="tableCloseBtn" class="bg-gray-200 text-gray-700 px-4 py-1.5 rounded-lg text-sm hover:bg-gray-300 transition">
                         <i class="fa fa-times"></i>关闭
                     </button>
                 </div>
             </div>
-            <div class="p-4 overflow-auto max-h-[calc(80vh-60px)]">
-                <pre class="bg-gray-100 p-4 rounded-lg overflow-x-auto text-sm text-gray-800">${escapeHtml(sqlContent)}</pre>
+            <div class="p-4 overflow-auto max-h-[calc(85vh-60px)]">
+                <pre class="rounded-lg overflow-x-auto text-sm"><code id="tableSqlCode" class="language-sql">${escapeHtml(sqlContent)}</code></pre>
             </div>
         </div>
     `;
     document.body.appendChild(modal);
+
+    // Highlight SQL syntax
+    if (window.hljs) {
+        window.hljs.highlightElement(document.getElementById('tableSqlCode'));
+    }
+
     document.getElementById('tableDownloadBtn').addEventListener('click', () => {
         downloadTableSQL(result.table, result.sql);
+    });
+    document.getElementById('tableCloseBtn').addEventListener('click', () => {
+        modal.remove();
     });
 }
 
