@@ -3,8 +3,20 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>数据库同步工具</title>
+    <title>数据对比工具</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: { 50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe', 300: '#93c5fd', 400: '#60a5fa', 500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 800: '#1e40af', 900: '#1e3a8a' },
+                        surface: { 50: '#f8fafc', 100: '#f1f5f9', 200: '#e2e8f0', 300: '#cbd5e1', 400: '#94a3b8', 500: '#64748b', 600: '#475569', 700: '#334155', 800: '#1e293b', 900: '#0f172a' }
+                    }
+                }
+            }
+        }
+    </script>
     <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <script src="https://unpkg.com/hyperscript.org@0.9.12"></script>
     <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
@@ -12,40 +24,75 @@
     <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/languages/sql.min.js"></script>
     <style>
+        *, *::before, *::after { box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-        }
-        .sidebar {
-            min-height: 100vh;
-        }
-        .scrollbar-thin::-webkit-scrollbar {
-            width: 6px;
-        }
-        .scrollbar-thin::-webkit-scrollbar-track {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             background: #f1f5f9;
+            color: #1e293b;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
         }
-        .scrollbar-thin::-webkit-scrollbar-thumb {
-            background: #cbd5e1;
-            border-radius: 3px;
-        }
-        .scrollbar-thin::-webkit-scrollbar-thumb:hover {
-            background: #94a3b8;
-        }
-        .diff-create {
-            background-color: #dcfce7;
-            border-left: 4px solid #22c55e;
-        }
-        .diff-alter {
-            background-color: #fef3c7;
-            border-left: 4px solid #f59e0b;
-        }
-        .diff-drop {
-            background-color: #fee2e2;
-            border-left: 4px solid #ef4444;
-        }
+        .sidebar { min-height: 100vh; transition: all 0.2s ease; }
+        .nav-link { position: relative; transition: all 0.2s ease; border-radius: 8px; margin: 2px 8px; }
+        .nav-link:hover { background: rgba(255,255,255,0.1); }
+        .nav-link.active { background: rgba(59,130,246,0.2); color: #60a5fa; }
+        .nav-link.active::before { content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%); width: 3px; height: 20px; background: #3b82f6; border-radius: 0 3px 3px 0; }
+        .card { background: #fff; border-radius: 12px; border: 1px solid #e2e8f0; transition: all 0.2s ease; }
+        .card:hover { border-color: #cbd5e1; }
+        .card-hover:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.05); transform: translateY(-1px); }
+        .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 20px; border-radius: 8px; font-weight: 500; font-size: 14px; transition: all 0.15s ease; cursor: pointer; border: none; outline: none; }
+        .btn:active { transform: scale(0.97); }
+        .btn-primary { background: #2563eb; color: #fff; }
+        .btn-primary:hover { background: #1d4ed8; box-shadow: 0 2px 8px rgba(37,99,235,0.3); }
+        .btn-success { background: #16a34a; color: #fff; }
+        .btn-success:hover { background: #15803d; box-shadow: 0 2px 8px rgba(22,163,74,0.3); }
+        .btn-danger { background: #dc2626; color: #fff; }
+        .btn-danger:hover { background: #b91c1c; box-shadow: 0 2px 8px rgba(220,38,38,0.3); }
+        .btn-ghost { background: transparent; color: #64748b; }
+        .btn-ghost:hover { background: #f1f5f9; color: #334155; }
+        .btn-outline { background: transparent; color: #475569; border: 1px solid #e2e8f0; }
+        .btn-outline:hover { background: #f8fafc; border-color: #cbd5e1; }
+        .btn-sm { padding: 5px 12px; font-size: 13px; border-radius: 6px; }
+        .btn-lg { padding: 10px 24px; font-size: 15px; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+        .input { width: 100%; padding: 9px 12px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 14px; transition: all 0.15s ease; outline: none; background: #fff; color: #1e293b; }
+        .input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
+        .input::placeholder { color: #94a3b8; }
+        select.input { appearance: none; background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e"); background-position: right 8px center; background-repeat: no-repeat; background-size: 20px; padding-right: 32px; }
+        select.input[multiple] { background-image: none; padding-right: 12px; }
+        .label { display: block; font-size: 13px; font-weight: 600; color: #475569; margin-bottom: 6px; }
+        .scrollbar-thin::-webkit-scrollbar { width: 5px; height: 5px; }
+        .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .shadow-card { box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04); }
+        .shadow-card-hover { box-shadow: 0 4px 12px rgba(0,0,0,0.05), 0 2px 4px rgba(0,0,0,0.03); }
+        .modal-overlay { animation: fadeIn 0.15s ease; }
+        .modal-content { animation: slideUp 0.2s ease; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .animate-pulse-soft { animation: pulse-soft 2s ease-in-out infinite; }
+        .badge { display: inline-flex; align-items: center; padding: 2px 10px; border-radius: 9999px; font-size: 12px; font-weight: 500; }
+        .badge-green { background: #dcfce7; color: #166534; }
+        .badge-red { background: #fee2e2; color: #991b1b; }
+        .badge-yellow { background: #fef9c3; color: #854d0e; }
+        .badge-blue { background: #dbeafe; color: #1e40af; }
+        .badge-purple { background: #f3e8ff; color: #6b21a8; }
+        .stat-card { position: relative; overflow: hidden; }
+        .stat-card .stat-icon { position: absolute; right: 16px; bottom: 16px; opacity: 0.12; font-size: 48px; }
+        .diff-create { background: #f0fdf4; border-left: 3px solid #22c55e; }
+        .diff-alter { background: #fffbeb; border-left: 3px solid #f59e0b; }
+        .diff-drop { background: #fef2f2; border-left: 3px solid #ef4444; }
+        .table-modern th { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; background: #f8fafc; }
+        .table-modern td { font-size: 14px; }
+        .table-modern tr { transition: background 0.1s ease; }
+        .table-modern tr:hover td { background: #f8fafc; }
+        .log-terminal { font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 12px; line-height: 1.7; }
+        .checkbox-custom { width: 16px; height: 16px; border-radius: 4px; border: 2px solid #cbd5e1; cursor: pointer; accent-color: #2563eb; }
     </style>
 </head>
-<body class="bg-gray-50">
+<body class="bg-surface-50">
     <div id="app"></div>
     <script src="app.js"></script>
 </body>
