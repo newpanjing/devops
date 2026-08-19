@@ -20,16 +20,26 @@ import (
 )
 
 type SchemaHandler struct {
-	db *sql.DB
+	db          *sql.DB
+	cacheMu     sync.RWMutex
+	tablesCache map[int]schemaTablesCacheEntry
+}
+
+const schemaTablesCacheTTL = 5 * time.Minute
+
+type schemaTablesCacheEntry struct {
+	tables    []string
+	expiresAt time.Time
 }
 
 func NewSchemaHandler(db *sql.DB) *SchemaHandler {
-	return &SchemaHandler{db: db}
+	return &SchemaHandler{db: db, tablesCache: make(map[int]schemaTablesCacheEntry)}
 }
 
 type SchemaCompareRequest struct {
-	SourceID  int   `json:"source_id"`
-	TargetIDs []int `json:"target_ids"`
+	SourceID  int      `json:"source_id"`
+	TargetIDs []int    `json:"target_ids"`
+	Tables    []string `json:"tables,omitempty"`
 }
 
 type SchemaCompareResponse struct {
@@ -41,14 +51,15 @@ type SchemaCompareResponse struct {
 }
 
 type SchemaCompareLog struct {
-	Level            string  `json:"level"`
-	TargetName       string  `json:"target_name,omitempty"`
-	TableName        string  `json:"table_name,omitempty"`
-	ColumnName       string  `json:"column_name,omitempty"`
-	Progress         float64 `json:"progress,omitempty"`
-	ElapsedSeconds   int64   `json:"elapsed_seconds,omitempty"`
-	RemainingSeconds int64   `json:"remaining_seconds,omitempty"`
-	Message          string  `json:"message"`
+	Level            string   `json:"level"`
+	TargetName       string   `json:"target_name,omitempty"`
+	TableName        string   `json:"table_name,omitempty"`
+	ColumnName       string   `json:"column_name,omitempty"`
+	Progress         float64  `json:"progress,omitempty"`
+	ElapsedSeconds   int64    `json:"elapsed_seconds,omitempty"`
+	RemainingSeconds int64    `json:"remaining_seconds,omitempty"`
+	Message          string   `json:"message"`
+	SQL              []string `json:"sql,omitempty"`
 }
 
 const (
@@ -134,7 +145,8 @@ func (h *SchemaHandler) CompareSchemasStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	emitEvent("complete", map[string]interface{}{"results": results})
+	emitEvent("complete", map[string]interface{}{"completed": true, "results": results})
+	return
 }
 
 func (h *SchemaHandler) compareSchemas(req SchemaCompareRequest, progressFunc func(SchemaCompareLog)) ([]SchemaCompareResponse, error) {
@@ -176,6 +188,13 @@ func (h *SchemaHandler) compareSchemas(req SchemaCompareRequest, progressFunc fu
 	sourceSchema, err := sourceDB.ReadSchema()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read source schema: %w", err)
+	}
+	if len(req.Tables) > 0 {
+		var found int
+		sourceSchema, found = filterSchemaTables(sourceSchema, req.Tables)
+		if found != len(req.Tables) {
+			return nil, fmt.Errorf("one or more selected tables were not found in source database")
+		}
 	}
 	log.Printf("[SchemaCompare] Source schema read: %d tables", len(sourceSchema.Tables))
 	notifySchemaCompareLog(progressFunc, SchemaCompareLog{
@@ -273,6 +292,9 @@ func (h *SchemaHandler) compareSchemas(req SchemaCompareRequest, progressFunc fu
 					}
 					continue
 				}
+				if len(req.Tables) > 0 {
+					targetSchema, _ = filterSchemaTables(targetSchema, req.Tables)
+				}
 				log.Printf("[SchemaCompare] Worker %d: Target schema read for %s: %d tables", workerID, task.targetConfig.Name, len(targetSchema.Tables))
 				notifySchemaCompareLog(progressFunc, SchemaCompareLog{
 					Level:      schemaLogLevelInfo,
@@ -293,6 +315,9 @@ func (h *SchemaHandler) compareSchemas(req SchemaCompareRequest, progressFunc fu
 						TableName:  progress.TableName,
 						ColumnName: progress.ColumnName,
 						Message:    progress.Message,
+					}
+					if progress.TableDiff != nil {
+						progressLog.SQL = dbcompare.GenerateSQL(&dbcompare.SchemaDiff{TableDiffs: []dbcompare.TableDiff{*progress.TableDiff}}, task.targetConfig.DBType)
 					}
 					notifySchemaCompareLog(progressFunc, progressTracker.next(progressLog))
 				})
@@ -407,6 +432,21 @@ func decodeSchemaCompareRequest(r *http.Request) (SchemaCompareRequest, error) {
 		return SchemaCompareRequest{}, fmt.Errorf("source database and target database are required")
 	}
 	return req, nil
+}
+
+// filterSchemaTables 保持数据库原始顺序，只保留用户选择的表，并返回实际命中的表数量。
+func filterSchemaTables(schema *dbcompare.Schema, selected []string) (*dbcompare.Schema, int) {
+	selectedSet := make(map[string]struct{}, len(selected))
+	for _, tableName := range selected {
+		selectedSet[tableName] = struct{}{}
+	}
+	filtered := make([]dbcompare.Table, 0, len(selectedSet))
+	for _, table := range schema.Tables {
+		if _, ok := selectedSet[table.Name]; ok {
+			filtered = append(filtered, table)
+		}
+	}
+	return &dbcompare.Schema{Tables: filtered}, len(filtered)
 }
 
 func notifySchemaCompareLog(progressFunc func(SchemaCompareLog), progress SchemaCompareLog) {
@@ -548,12 +588,16 @@ func (h *SchemaHandler) GetTables(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid config ID"})
 		return
 	}
-
 	config, err := audit.GetDBConfigByID(h.db, configID)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to get config"})
+		return
+	}
+	if tables, ok := h.cachedTables(configID); ok {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tables)
 		return
 	}
 
@@ -585,8 +629,21 @@ func (h *SchemaHandler) GetTables(w http.ResponseWriter, r *http.Request) {
 	for _, table := range schema.Tables {
 		tables = append(tables, table.Name)
 	}
+	h.cacheMu.Lock()
+	h.tablesCache[configID] = schemaTablesCacheEntry{tables: append([]string(nil), tables...), expiresAt: time.Now().Add(schemaTablesCacheTTL)}
+	h.cacheMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(tables)
+}
+
+func (h *SchemaHandler) cachedTables(configID int) ([]string, bool) {
+	h.cacheMu.RLock()
+	entry, ok := h.tablesCache[configID]
+	h.cacheMu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) {
+		return nil, false
+	}
+	return append([]string(nil), entry.tables...), true
 }

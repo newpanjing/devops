@@ -15,6 +15,8 @@ type SchemaCompareProgress struct {
 	Current    int
 	Total      int
 	Message    string
+	// TableDiff 表示当前表完成比对后产生的差异，供流式调用方即时生成 SQL。
+	TableDiff *TableDiff
 }
 
 type SchemaCompareProgressFunc func(progress SchemaCompareProgress)
@@ -61,24 +63,26 @@ func CompareSchemasWithProgress(source, target *Schema, workerCount int, progres
 					})
 
 					if targetTable, exists := targetTables[sourceTable.Name]; exists {
+						tableDiff := compareTablesWithProgress(sourceTable, targetTable, progressFunc)
+						if tableDiff != nil {
+							notifySchemaCompareProgress(progressFunc, SchemaCompareProgress{TableName: sourceTable.Name, Message: "已完成表比对", TableDiff: tableDiff})
+						}
 						results <- tableCompareResult{
 							index:     tableIndex,
-							tableDiff: compareTablesWithProgress(sourceTable, targetTable, progressFunc),
+							tableDiff: tableDiff,
 						}
 						continue
 					}
 
+					tableDiff := &TableDiff{Type: DiffTypeCreate, TableName: sourceTable.Name, SourceTable: sourceTable}
 					notifySchemaCompareProgress(progressFunc, SchemaCompareProgress{
 						TableName: sourceTable.Name,
-						Message:   "目标数据库缺少该表，标记为新增",
+						Message:   "已完成表比对，目标数据库缺少该表",
+						TableDiff: tableDiff,
 					})
 					results <- tableCompareResult{
-						index: tableIndex,
-						tableDiff: &TableDiff{
-							Type:        DiffTypeCreate,
-							TableName:   sourceTable.Name,
-							SourceTable: sourceTable,
-						},
+						index:     tableIndex,
+						tableDiff: tableDiff,
 					}
 				}
 			}()
@@ -111,6 +115,7 @@ func CompareSchemasWithProgress(source, target *Schema, workerCount int, progres
 			notifySchemaCompareProgress(progressFunc, SchemaCompareProgress{
 				TableName: targetTable.Name,
 				Message:   "源数据库缺少该表，标记为删除",
+				TableDiff: &TableDiff{Type: DiffTypeDrop, TableName: targetTable.Name, TargetTable: targetTable},
 			})
 			diff.TableDiffs = append(diff.TableDiffs, TableDiff{
 				Type:        DiffTypeDrop,

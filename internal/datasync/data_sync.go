@@ -7,6 +7,9 @@ import (
 	"dbsync/internal/dbcompare"
 )
 
+// IgnoredIDColumn 是跨库数据比对时不参与匹配和写入的主键字段。
+const IgnoredIDColumn = "id"
+
 type SyncResult struct {
 	Table    string   `json:"table"`
 	Inserted int      `json:"inserted"`
@@ -24,11 +27,13 @@ type DataSyncProgress struct {
 
 type DataSyncProgressFunc func(progress DataSyncProgress)
 
-func PreviewTableData(source, target *dbcompare.DBConnection, tableName string, deleteMissing bool) (*SyncResult, error) {
-	return PreviewTableDataWithProgress(source, target, tableName, deleteMissing, nil)
+// PreviewTableData 按指定字段匹配两端数据，只生成差异 SQL，不执行写入。
+func PreviewTableData(source, target *dbcompare.DBConnection, tableName, comparisonField string, deleteMissing bool) (*SyncResult, error) {
+	return PreviewTableDataWithProgress(source, target, tableName, comparisonField, deleteMissing, nil)
 }
 
-func PreviewTableDataWithProgress(source, target *dbcompare.DBConnection, tableName string, deleteMissing bool, progressFunc DataSyncProgressFunc) (*SyncResult, error) {
+// PreviewTableDataWithProgress 在比对过程中向调用方输出当前处理状态。
+func PreviewTableDataWithProgress(source, target *dbcompare.DBConnection, tableName, comparisonField string, deleteMissing bool, progressFunc DataSyncProgressFunc) (*SyncResult, error) {
 	result := &SyncResult{Table: tableName}
 
 	notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: "正在读取源表结构"})
@@ -64,9 +69,8 @@ func PreviewTableDataWithProgress(source, target *dbcompare.DBConnection, tableN
 		return nil, fmt.Errorf("table %s not found in target", tableName)
 	}
 
-	pkColumns := getPrimaryKeyColumns(sourceTable)
-	if len(pkColumns) == 0 {
-		return nil, fmt.Errorf("table %s has no primary key", tableName)
+	if err := validateComparisonField(sourceTable, targetTable, comparisonField); err != nil {
+		return nil, err
 	}
 
 	notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: "正在读取源表数据"})
@@ -84,35 +88,41 @@ func PreviewTableDataWithProgress(source, target *dbcompare.DBConnection, tableN
 	result.Total = len(sourceData)
 	notifyDataSyncProgress(progressFunc, DataSyncProgress{
 		TableName: tableName,
-		Message:   fmt.Sprintf("源表 %d 行，目标表 %d 行，正在按主键比对", len(sourceData), len(targetData)),
+		Message:   fmt.Sprintf("源表 %d 行，目标表 %d 行，正在按字段 %s 比对", len(sourceData), len(targetData), comparisonField),
 	})
 
-	sourcePKMap := buildPKMap(sourceData, pkColumns)
-	targetPKMap := buildPKMap(targetData, pkColumns)
+	sourceFieldMap, err := buildFieldMap(sourceData, comparisonField)
+	if err != nil {
+		return nil, fmt.Errorf("source table %s: %w", tableName, err)
+	}
+	targetFieldMap, err := buildFieldMap(targetData, comparisonField)
+	if err != nil {
+		return nil, fmt.Errorf("target table %s: %w", tableName, err)
+	}
 
-	for pk, sourceRow := range sourcePKMap {
-		if targetRow, ok := targetPKMap[pk]; ok {
+	for key, sourceRow := range sourceFieldMap {
+		if targetRow, ok := targetFieldMap[key]; ok {
 			if !rowsEqual(sourceRow, targetRow) {
-				sql := buildUpdateSQL(targetTable, sourceRow, pkColumns)
+				sql := buildUpdateSQL(targetTable, sourceRow, comparisonField)
 				result.SQL = append(result.SQL, sql)
 				result.Updated++
-				notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现修改记录，主键: %s", pk)})
+				notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现修改记录，匹配字段值: %s", key)})
 			}
-			delete(targetPKMap, pk)
+			delete(targetFieldMap, key)
 		} else {
 			sql := buildInsertSQL(targetTable, sourceRow)
 			result.SQL = append(result.SQL, sql)
 			result.Inserted++
-			notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现新增记录，主键: %s", pk)})
+			notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现新增记录，匹配字段值: %s", key)})
 		}
 	}
 
 	if deleteMissing {
-		for pk := range targetPKMap {
-			sql := buildDeleteSQL(targetTable, pk, pkColumns)
+		for key, targetRow := range targetFieldMap {
+			sql := buildDeleteSQL(targetTable, targetRow[comparisonField], comparisonField)
 			result.SQL = append(result.SQL, sql)
 			result.Deleted++
-			notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现删除记录，主键: %s", pk)})
+			notifyDataSyncProgress(progressFunc, DataSyncProgress{TableName: tableName, Message: fmt.Sprintf("发现删除记录，匹配字段值: %s", key)})
 		}
 	}
 
@@ -130,16 +140,28 @@ func notifyDataSyncProgress(progressFunc DataSyncProgressFunc, progress DataSync
 	}
 }
 
-func getPrimaryKeyColumns(table *dbcompare.Table) []string {
-	var cols []string
-	for _, col := range table.Columns {
-		if col.PrimaryKey {
-			cols = append(cols, col.Name)
-		}
+// validateComparisonField 确保用户选择的匹配字段可在两端表中安全使用。
+func validateComparisonField(sourceTable, targetTable *dbcompare.Table, comparisonField string) error {
+	if comparisonField == "" || strings.EqualFold(comparisonField, IgnoredIDColumn) {
+		return fmt.Errorf("comparison field must not be id")
 	}
-	return cols
+	if !hasColumn(sourceTable, comparisonField) || !hasColumn(targetTable, comparisonField) {
+		return fmt.Errorf("comparison field %s not found in both tables", comparisonField)
+	}
+	return nil
 }
 
+// hasColumn 判断指定字段是否存在于表结构中。
+func hasColumn(table *dbcompare.Table, columnName string) bool {
+	for _, column := range table.Columns {
+		if column.Name == columnName {
+			return true
+		}
+	}
+	return false
+}
+
+// readTableData 读取表的全部字段和值，用于内存差异比对。
 func readTableData(db *dbcompare.DBConnection, table *dbcompare.Table) ([]map[string]interface{}, error) {
 	cols := make([]string, 0, len(table.Columns))
 	for _, col := range table.Columns {
@@ -180,24 +202,29 @@ func readTableData(db *dbcompare.DBConnection, table *dbcompare.Table) ([]map[st
 	return result, nil
 }
 
-func buildPKMap(data []map[string]interface{}, pkColumns []string) map[string]map[string]interface{} {
+// buildFieldMap 使用用户选择字段的值作为记录唯一键，并拒绝重复值。
+func buildFieldMap(data []map[string]interface{}, comparisonField string) (map[string]map[string]interface{}, error) {
 	result := make(map[string]map[string]interface{})
 	for _, row := range data {
-		var pkParts []string
-		for _, pkCol := range pkColumns {
-			pkParts = append(pkParts, fmt.Sprintf("%v", row[pkCol]))
+		value := row[comparisonField]
+		if value == nil {
+			return nil, fmt.Errorf("comparison field %s contains NULL", comparisonField)
 		}
-		pk := strings.Join(pkParts, "|")
-		result[pk] = row
+		key := fmt.Sprintf("%T:%v", value, value)
+		if _, exists := result[key]; exists {
+			return nil, fmt.Errorf("comparison field %s contains duplicate value %v", comparisonField, value)
+		}
+		result[key] = row
 	}
-	return result
+	return result, nil
 }
 
+// rowsEqual 比较两行的业务字段值，忽略两端独立生成的 id。
 func rowsEqual(a, b map[string]interface{}) bool {
-	if len(a) != len(b) {
-		return false
-	}
 	for k, v := range a {
+		if strings.EqualFold(k, IgnoredIDColumn) {
+			continue
+		}
 		if bv, ok := b[k]; !ok || !valuesEqual(v, bv) {
 			return false
 		}
@@ -322,12 +349,13 @@ func GetTableList(db *dbcompare.DBConnection) ([]string, error) {
 	return tables, nil
 }
 
+// buildInsertSQL 为源库独有记录生成不含 id 的插入语句。
 func buildInsertSQL(table *dbcompare.Table, row map[string]interface{}) string {
 	var cols []string
 	var values []string
 
 	for _, col := range table.Columns {
-		if col.AutoIncrement {
+		if col.AutoIncrement || strings.EqualFold(col.Name, IgnoredIDColumn) {
 			continue
 		}
 		cols = append(cols, fmt.Sprintf("`%s`", col.Name))
@@ -337,33 +365,26 @@ func buildInsertSQL(table *dbcompare.Table, row map[string]interface{}) string {
 	return fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s);", table.Name, strings.Join(cols, ", "), strings.Join(values, ", "))
 }
 
-func buildUpdateSQL(table *dbcompare.Table, row map[string]interface{}, pkColumns []string) string {
+// buildUpdateSQL 使用匹配字段定位记录，并更新其余非 id 字段。
+func buildUpdateSQL(table *dbcompare.Table, row map[string]interface{}, comparisonField string) string {
 	var setClauses []string
 	var whereClauses []string
 
 	for _, col := range table.Columns {
-		if col.PrimaryKey || col.AutoIncrement {
+		if col.Name == comparisonField || col.AutoIncrement || strings.EqualFold(col.Name, IgnoredIDColumn) {
 			continue
 		}
 		setClauses = append(setClauses, fmt.Sprintf("`%s` = %s", col.Name, formatSQLValue(row[col.Name])))
 	}
 
-	for _, pkCol := range pkColumns {
-		whereClauses = append(whereClauses, fmt.Sprintf("`%s` = %s", pkCol, formatSQLValue(row[pkCol])))
-	}
+	whereClauses = append(whereClauses, fmt.Sprintf("`%s` = %s", comparisonField, formatSQLValue(row[comparisonField])))
 
 	return fmt.Sprintf("UPDATE `%s` SET %s WHERE %s;", table.Name, strings.Join(setClauses, ", "), strings.Join(whereClauses, " AND "))
 }
 
-func buildDeleteSQL(table *dbcompare.Table, pk string, pkColumns []string) string {
-	pkParts := strings.Split(pk, "|")
-	var whereClauses []string
-
-	for i, pkCol := range pkColumns {
-		whereClauses = append(whereClauses, fmt.Sprintf("`%s` = %s", pkCol, formatSQLValue(pkParts[i])))
-	}
-
-	return fmt.Sprintf("DELETE FROM `%s` WHERE %s;", table.Name, strings.Join(whereClauses, " AND "))
+// buildDeleteSQL 使用匹配字段值生成目标库独有记录的删除语句。
+func buildDeleteSQL(table *dbcompare.Table, comparisonValue interface{}, comparisonField string) string {
+	return fmt.Sprintf("DELETE FROM `%s` WHERE `%s` = %s;", table.Name, comparisonField, formatSQLValue(comparisonValue))
 }
 
 func formatSQLValue(v interface{}) string {
