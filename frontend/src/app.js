@@ -682,6 +682,18 @@ function getSchemaChangeGroups(tableDiffs) {
             const detail = diff.type === 'ALTER' ? `${diff.target_column?.type || ''} -> ${diff.source_column?.type || ''}` : column.type || '字段变更';
             groups[groupIndex[diff.type]].items.push({ name: `${tableDiff.table_name}.${diff.column_name}`, detail });
         });
+        (tableDiff.index_diffs || []).forEach(diff => {
+            const index = diff.source_index || diff.target_index || {};
+            const indexType = index.unique ? '唯一索引' : '普通索引';
+            const columns = (index.columns || []).join(', ');
+            const detail = diff.type === 'ALTER' ? '索引定义已变更' : `${indexType}${columns ? ` (${columns})` : ''}`;
+            groups[groupIndex[diff.type]].items.push({ name: `${tableDiff.table_name}.${diff.index_name}`, detail: `索引：${detail}` });
+        });
+        (tableDiff.foreign_key_diffs || []).forEach(diff => {
+            const fk = diff.source_foreign_key || diff.target_foreign_key || {};
+            const detail = diff.type === 'ALTER' ? `外键规则已变更 (ON DELETE ${fk.on_delete || 'RESTRICT'})` : `外键 -> ${fk.to_table || ''}`;
+            groups[groupIndex[diff.type]].items.push({ name: `${tableDiff.table_name}.${diff.foreign_key_name}`, detail });
+        });
         if (tableDiff.table_comment_changed) groups[1].items.push({ name: tableDiff.table_name, detail: '表备注已修改' });
     });
     return groups.filter(group => group.items.length > 0);

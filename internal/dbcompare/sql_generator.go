@@ -13,19 +13,33 @@ const (
 
 func GenerateSQL(diff *SchemaDiff, dbType string) []string {
 	var sqls []string
+	// 新增外键约束统一放到脚本最后，避免被引用的表尚未创建导致执行失败。
+	var foreignKeySQLs []string
 	for _, tableDiff := range diff.TableDiffs {
 		switch tableDiff.Type {
 		case DiffTypeCreate:
 			if tableDiff.SourceTable != nil {
 				sqls = append(sqls, generateCreateTableSQL(tableDiff.SourceTable, dbType))
+				for indexIndex := range tableDiff.SourceTable.Indexes {
+					if indexSQL := generateAddIndexSQL(tableDiff.TableName, &tableDiff.SourceTable.Indexes[indexIndex], dbType); indexSQL != "" {
+						sqls = append(sqls, indexSQL)
+					}
+				}
+				for fkIndex := range tableDiff.SourceTable.ForeignKeys {
+					if fkSQL := generateAddForeignKeySQL(tableDiff.TableName, &tableDiff.SourceTable.ForeignKeys[fkIndex], dbType); fkSQL != "" {
+						foreignKeySQLs = append(foreignKeySQLs, fkSQL)
+					}
+				}
 			}
 		case DiffTypeAlter:
-			sqls = append(sqls, generateAlterTableSQL(&tableDiff, dbType)...)
+			structuralSQLs, addForeignKeySQLs := generateAlterTableSQL(&tableDiff, dbType)
+			sqls = append(sqls, structuralSQLs...)
+			foreignKeySQLs = append(foreignKeySQLs, addForeignKeySQLs...)
 		case DiffTypeDrop:
 			sqls = append(sqls, generateDropTableSQL(tableDiff.TableName, dbType))
 		}
 	}
-	return sqls
+	return append(sqls, foreignKeySQLs...)
 }
 
 func generateCreateTableSQL(table *Table, dbType string) string {
@@ -50,8 +64,37 @@ func generateCreateTableSQL(table *Table, dbType string) string {
 	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n  %s\n)%s;", quoteIdentifier(table.Name), strings.Join(definitions, ",\n  "), tableOptions)
 }
 
-func generateAlterTableSQL(tableDiff *TableDiff, dbType string) []string {
+// generateAlterTableSQL 返回结构变更 SQL 和需要延后执行的新增外键 SQL。
+// 语句顺序保证先删除约束/索引，再改字段，最后建索引、加外键，避免依赖冲突。
+func generateAlterTableSQL(tableDiff *TableDiff, dbType string) ([]string, []string) {
 	var sqls []string
+	var foreignKeySQLs []string
+
+	// 1. 先删除发生变更或多余的外键约束（删除列/索引前必须先解除外键）
+	for _, fkDiff := range tableDiff.ForeignKeyDiffs {
+		switch fkDiff.Type {
+		case DiffTypeAlter, DiffTypeDrop:
+			if fkDiff.TargetForeignKey != nil {
+				if sql := generateDropForeignKeySQL(tableDiff.TableName, fkDiff.TargetForeignKey.Name, dbType); sql != "" {
+					sqls = append(sqls, sql)
+				}
+			}
+		}
+	}
+
+	// 2. 删除发生变更或多余的索引
+	for _, indexDiff := range tableDiff.IndexDiffs {
+		switch indexDiff.Type {
+		case DiffTypeAlter, DiffTypeDrop:
+			if indexDiff.TargetIndex != nil {
+				if sql := generateDropIndexSQL(tableDiff.TableName, indexDiff.TargetIndex.Name, dbType); sql != "" {
+					sqls = append(sqls, sql)
+				}
+			}
+		}
+	}
+
+	// 3. 表备注与字段变更
 	if tableDiff.TableCommentChanged && tableDiff.SourceTable != nil {
 		sqls = append(sqls, generateAlterTableCommentSQL(tableDiff.SourceTable, dbType))
 	}
@@ -69,7 +112,32 @@ func generateAlterTableSQL(tableDiff *TableDiff, dbType string) []string {
 			sqls = append(sqls, generateDropColumnSQL(tableDiff.TableName, colDiff.ColumnName, dbType))
 		}
 	}
-	return sqls
+
+	// 4. 新建索引（含变更索引的重建）
+	for _, indexDiff := range tableDiff.IndexDiffs {
+		switch indexDiff.Type {
+		case DiffTypeCreate, DiffTypeAlter:
+			if indexDiff.SourceIndex != nil {
+				if sql := generateAddIndexSQL(tableDiff.TableName, indexDiff.SourceIndex, dbType); sql != "" {
+					sqls = append(sqls, sql)
+				}
+			}
+		}
+	}
+
+	// 5. 新建外键约束（含变更外键的重建），由调用方延后到所有表结构变更完成后执行
+	for _, fkDiff := range tableDiff.ForeignKeyDiffs {
+		switch fkDiff.Type {
+		case DiffTypeCreate, DiffTypeAlter:
+			if fkDiff.SourceForeignKey != nil {
+				if sql := generateAddForeignKeySQL(tableDiff.TableName, fkDiff.SourceForeignKey, dbType); sql != "" {
+					foreignKeySQLs = append(foreignKeySQLs, sql)
+				}
+			}
+		}
+	}
+
+	return sqls, foreignKeySQLs
 }
 
 func generateAddColumnSQL(tableName string, column *Column, dbType string) string {
@@ -229,4 +297,128 @@ func generateAlterTableCommentSQL(table *Table, dbType string) string {
 	default:
 		return fmt.Sprintf("-- Unsupported table comment change for database type: %s", dbType)
 	}
+}
+
+func generateAddIndexSQL(tableName string, index *Index, dbType string) string {
+	if strings.EqualFold(index.Name, primaryKeyIndexName) {
+		return ""
+	}
+	columns := index.Columns
+	if len(columns) == 0 && index.Column != "" {
+		columns = []string{index.Column}
+	}
+	quotedColumns := quoteIdentifierList(columns, dbType)
+	if len(quotedColumns) == 0 {
+		return ""
+	}
+
+	uniqueKeyword := ""
+	if index.Unique {
+		uniqueKeyword = "UNIQUE "
+	}
+
+	switch dbType {
+	case sqlDatabaseTypeMySQL:
+		return fmt.Sprintf("ALTER TABLE %s ADD %sINDEX %s (%s);",
+			quoteIdentifier(tableName), uniqueKeyword, quoteIdentifier(index.Name), strings.Join(quotedColumns, ", "))
+	case sqlDatabaseTypePostgres:
+		return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s);",
+			uniqueKeyword, quoteIdentifierByDB(index.Name, dbType), quoteIdentifierByDB(tableName, dbType), strings.Join(quotedColumns, ", "))
+	case sqlDatabaseTypeSQLite:
+		return fmt.Sprintf("CREATE %sINDEX IF NOT EXISTS %s ON %s (%s);",
+			uniqueKeyword, quoteIdentifier(index.Name), quoteIdentifier(tableName), strings.Join(quotedColumns, ", "))
+	default:
+		return fmt.Sprintf("-- Unsupported database type: %s", dbType)
+	}
+}
+
+func generateDropIndexSQL(tableName, indexName string, dbType string) string {
+	if strings.EqualFold(indexName, primaryKeyIndexName) {
+		return ""
+	}
+	switch dbType {
+	case sqlDatabaseTypeMySQL:
+		return fmt.Sprintf("ALTER TABLE %s DROP INDEX %s;", quoteIdentifier(tableName), quoteIdentifier(indexName))
+	case sqlDatabaseTypePostgres:
+		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", quoteIdentifierByDB(indexName, dbType))
+	case sqlDatabaseTypeSQLite:
+		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", quoteIdentifier(indexName))
+	default:
+		return fmt.Sprintf("-- Unsupported database type: %s", dbType)
+	}
+}
+
+func generateAddForeignKeySQL(tableName string, foreignKey *ForeignKey, dbType string) string {
+	fromColumns := foreignKeyFromColumns(foreignKey)
+	toColumns := foreignKeyToColumns(foreignKey)
+	if len(fromColumns) == 0 || foreignKey.ToTable == "" || len(toColumns) == 0 {
+		return ""
+	}
+
+	constraintName := foreignKey.Name
+	if constraintName == "" {
+		constraintName = fmt.Sprintf("fk_%s_%s", tableName, fromColumns[0])
+	}
+
+	switch dbType {
+	case sqlDatabaseTypeMySQL, sqlDatabaseTypePostgres:
+		return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)%s%s;",
+			quoteIdentifierByDB(tableName, dbType),
+			quoteIdentifierByDB(constraintName, dbType),
+			strings.Join(quoteIdentifierList(fromColumns, dbType), ", "),
+			quoteIdentifierByDB(foreignKey.ToTable, dbType),
+			strings.Join(quoteIdentifierList(toColumns, dbType), ", "),
+			generateForeignKeyRuleClause("ON DELETE", foreignKey.OnDelete),
+			generateForeignKeyRuleClause("ON UPDATE", foreignKey.OnUpdate),
+		)
+	case sqlDatabaseTypeSQLite:
+		return fmt.Sprintf("-- SQLite does not support adding foreign key constraint %s via ALTER TABLE", constraintName)
+	default:
+		return fmt.Sprintf("-- Unsupported database type: %s", dbType)
+	}
+}
+
+func generateDropForeignKeySQL(tableName, foreignKeyName string, dbType string) string {
+	if foreignKeyName == "" {
+		return ""
+	}
+	switch dbType {
+	case sqlDatabaseTypeMySQL:
+		return fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", quoteIdentifier(tableName), quoteIdentifier(foreignKeyName))
+	case sqlDatabaseTypePostgres:
+		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", quoteIdentifierByDB(tableName, dbType), quoteIdentifierByDB(foreignKeyName, dbType))
+	case sqlDatabaseTypeSQLite:
+		return fmt.Sprintf("-- SQLite does not support dropping foreign key constraint %s via ALTER TABLE", foreignKeyName)
+	default:
+		return fmt.Sprintf("-- Unsupported database type: %s", dbType)
+	}
+}
+
+func generateForeignKeyRuleClause(clause, rule string) string {
+	normalized := strings.ToUpper(strings.TrimSpace(rule))
+	switch normalized {
+	case "CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT", "NO ACTION":
+		return fmt.Sprintf(" %s %s", clause, normalized)
+	default:
+		return ""
+	}
+}
+
+func quoteIdentifierByDB(identifier, dbType string) string {
+	if dbType == sqlDatabaseTypePostgres {
+		return fmt.Sprintf("\"%s\"", strings.ReplaceAll(identifier, "\"", "\"\""))
+	}
+	return quoteIdentifier(identifier)
+}
+
+func quoteIdentifierList(identifiers []string, dbType string) []string {
+	quoted := make([]string, 0, len(identifiers))
+	for _, identifier := range identifiers {
+		identifier = strings.TrimSpace(identifier)
+		if identifier == "" {
+			continue
+		}
+		quoted = append(quoted, quoteIdentifierByDB(identifier, dbType))
+	}
+	return quoted
 }

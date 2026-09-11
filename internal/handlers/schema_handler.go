@@ -326,7 +326,7 @@ func (h *SchemaHandler) compareSchemas(req SchemaCompareRequest, progressFunc fu
 
 				diffCount := 0
 				for _, td := range diff.TableDiffs {
-					diffCount += len(td.ColumnDiffs) + 1
+					diffCount += len(td.ColumnDiffs) + len(td.IndexDiffs) + len(td.ForeignKeyDiffs) + 1
 				}
 				log.Printf("[SchemaCompare] Worker %d: Schema compared: %d differences found, %d SQL statements generated", workerID, diffCount, len(sqlStatements))
 				notifySchemaCompareLog(progressFunc, progressTracker.complete(SchemaCompareLog{

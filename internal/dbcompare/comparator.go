@@ -209,11 +209,171 @@ func compareTablesWithProgress(source, target *Table, progressFunc SchemaCompare
 		}
 	}
 
-	if len(diff.ColumnDiffs) == 0 && !diff.TableCommentChanged {
+	diff.IndexDiffs = compareIndexes(source.Indexes, target.Indexes)
+	diff.ForeignKeyDiffs = compareForeignKeys(source.ForeignKeys, target.ForeignKeys)
+
+	if len(diff.ColumnDiffs) == 0 && len(diff.IndexDiffs) == 0 && len(diff.ForeignKeyDiffs) == 0 && !diff.TableCommentChanged {
 		return nil
 	}
 
 	return diff
+}
+
+// primaryKeyIndexName 是 MySQL 主键在 SHOW INDEX 中使用的索引名，主键已通过字段定义生成，需要跳过。
+const primaryKeyIndexName = "PRIMARY"
+
+func compareIndexes(sourceIndexes, targetIndexes []Index) []IndexDiff {
+	targetIndexMap := make(map[string]*Index)
+	for i := range targetIndexes {
+		if strings.EqualFold(targetIndexes[i].Name, primaryKeyIndexName) {
+			continue
+		}
+		targetIndexMap[targetIndexes[i].Name] = &targetIndexes[i]
+	}
+	sourceIndexMap := make(map[string]*Index)
+	for i := range sourceIndexes {
+		if strings.EqualFold(sourceIndexes[i].Name, primaryKeyIndexName) {
+			continue
+		}
+		sourceIndexMap[sourceIndexes[i].Name] = &sourceIndexes[i]
+	}
+
+	var diffs []IndexDiff
+	for sourceIndexIndex := range sourceIndexes {
+		sourceIndex := &sourceIndexes[sourceIndexIndex]
+		if strings.EqualFold(sourceIndex.Name, primaryKeyIndexName) {
+			continue
+		}
+		if targetIndex, ok := targetIndexMap[sourceIndex.Name]; ok {
+			if !indexesEqual(sourceIndex, targetIndex) {
+				diffs = append(diffs, IndexDiff{
+					Type:        DiffTypeAlter,
+					IndexName:   sourceIndex.Name,
+					SourceIndex: sourceIndex,
+					TargetIndex: targetIndex,
+				})
+			}
+		} else {
+			diffs = append(diffs, IndexDiff{
+				Type:        DiffTypeCreate,
+				IndexName:   sourceIndex.Name,
+				SourceIndex: sourceIndex,
+			})
+		}
+	}
+
+	for targetIndexIndex := range targetIndexes {
+		targetIndex := &targetIndexes[targetIndexIndex]
+		if strings.EqualFold(targetIndex.Name, primaryKeyIndexName) {
+			continue
+		}
+		if _, exists := sourceIndexMap[targetIndex.Name]; !exists {
+			diffs = append(diffs, IndexDiff{
+				Type:        DiffTypeDrop,
+				IndexName:   targetIndex.Name,
+				TargetIndex: targetIndex,
+			})
+		}
+	}
+
+	return diffs
+}
+
+func indexesEqual(a, b *Index) bool {
+	if a.Unique != b.Unique || len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	for i := range a.Columns {
+		if !strings.EqualFold(a.Columns[i], b.Columns[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func compareForeignKeys(sourceForeignKeys, targetForeignKeys []ForeignKey) []ForeignKeyDiff {
+	targetFKMap := make(map[string]*ForeignKey)
+	for i := range targetForeignKeys {
+		targetFKMap[foreignKeyIdentity(&targetForeignKeys[i])] = &targetForeignKeys[i]
+	}
+	sourceFKMap := make(map[string]*ForeignKey)
+	for i := range sourceForeignKeys {
+		sourceFKMap[foreignKeyIdentity(&sourceForeignKeys[i])] = &sourceForeignKeys[i]
+	}
+
+	var diffs []ForeignKeyDiff
+	for sourceFKIndex := range sourceForeignKeys {
+		sourceFK := &sourceForeignKeys[sourceFKIndex]
+		if targetFK, ok := targetFKMap[foreignKeyIdentity(sourceFK)]; ok {
+			if !foreignKeysEqual(sourceFK, targetFK) {
+				diffs = append(diffs, ForeignKeyDiff{
+					Type:             DiffTypeAlter,
+					ForeignKeyName:   sourceFK.Name,
+					SourceForeignKey: sourceFK,
+					TargetForeignKey: targetFK,
+				})
+			}
+		} else {
+			diffs = append(diffs, ForeignKeyDiff{
+				Type:             DiffTypeCreate,
+				ForeignKeyName:   sourceFK.Name,
+				SourceForeignKey: sourceFK,
+			})
+		}
+	}
+
+	for targetFKIndex := range targetForeignKeys {
+		targetFK := &targetForeignKeys[targetFKIndex]
+		if _, exists := sourceFKMap[foreignKeyIdentity(targetFK)]; !exists {
+			diffs = append(diffs, ForeignKeyDiff{
+				Type:             DiffTypeDrop,
+				ForeignKeyName:   targetFK.Name,
+				TargetForeignKey: targetFK,
+			})
+		}
+	}
+
+	return diffs
+}
+
+// foreignKeyIdentity 以外键关系（本端列、引用表、引用列）作为匹配依据，
+// 避免源库和目标库自动生成的约束名不同（如 MySQL 的 tbl_ibfk_N）导致误报。
+func foreignKeyIdentity(fk *ForeignKey) string {
+	return strings.ToLower(strings.Join(foreignKeyFromColumns(fk), ",") + "->" + fk.ToTable + "(" + strings.Join(foreignKeyToColumns(fk), ",") + ")")
+}
+
+func foreignKeysEqual(a, b *ForeignKey) bool {
+	return normalizeForeignKeyRule(a.OnDelete) == normalizeForeignKeyRule(b.OnDelete) &&
+		normalizeForeignKeyRule(a.OnUpdate) == normalizeForeignKeyRule(b.OnUpdate)
+}
+
+// normalizeForeignKeyRule 统一外键级联规则的写法，空值按默认 RESTRICT 处理。
+func normalizeForeignKeyRule(rule string) string {
+	normalized := strings.ToUpper(strings.TrimSpace(rule))
+	if normalized == "" {
+		return "RESTRICT"
+	}
+	return normalized
+}
+
+func foreignKeyFromColumns(fk *ForeignKey) []string {
+	if len(fk.FromColumns) > 0 {
+		return fk.FromColumns
+	}
+	if fk.FromColumn != "" {
+		return []string{fk.FromColumn}
+	}
+	return nil
+}
+
+func foreignKeyToColumns(fk *ForeignKey) []string {
+	if len(fk.ToColumns) > 0 {
+		return fk.ToColumns
+	}
+	if fk.ToColumn != "" {
+		return []string{fk.ToColumn}
+	}
+	return nil
 }
 
 func notifySchemaCompareProgress(progressFunc SchemaCompareProgressFunc, progress SchemaCompareProgress) {

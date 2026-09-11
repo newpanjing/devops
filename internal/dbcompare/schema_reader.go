@@ -168,27 +168,41 @@ func (dc *DBConnection) readMySQLForeignKeys(tableName string) ([]ForeignKey, er
 		LEFT JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
 			ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
 		WHERE kcu.TABLE_SCHEMA = DATABASE() AND kcu.TABLE_NAME = ? AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+		ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
 	`, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get foreign keys: %w", err)
 	}
 	defer rows.Close()
 
-	var foreignKeys []ForeignKey
+	fkMap := make(map[string]*ForeignKey)
+	var fkOrder []string
 	for rows.Next() {
 		var name, fromCol, toTable, toCol, onDelete, onUpdate sql.NullString
 		if err := rows.Scan(&name, &fromCol, &toTable, &toCol, &onDelete, &onUpdate); err != nil {
 			return nil, fmt.Errorf("failed to scan foreign key: %w", err)
 		}
 
-		foreignKeys = append(foreignKeys, ForeignKey{
-			Name:       name.String,
-			FromColumn: fromCol.String,
-			ToTable:    toTable.String,
-			ToColumn:   toCol.String,
-			OnDelete:   onDelete.String,
-			OnUpdate:   onUpdate.String,
-		})
+		fk, ok := fkMap[name.String]
+		if !ok {
+			fk = &ForeignKey{
+				Name:       name.String,
+				FromColumn: fromCol.String,
+				ToTable:    toTable.String,
+				ToColumn:   toCol.String,
+				OnDelete:   onDelete.String,
+				OnUpdate:   onUpdate.String,
+			}
+			fkMap[name.String] = fk
+			fkOrder = append(fkOrder, name.String)
+		}
+		fk.FromColumns = append(fk.FromColumns, fromCol.String)
+		fk.ToColumns = append(fk.ToColumns, toCol.String)
+	}
+
+	foreignKeys := make([]ForeignKey, 0, len(fkOrder))
+	for _, name := range fkOrder {
+		foreignKeys = append(foreignKeys, *fkMap[name])
 	}
 
 	return foreignKeys, nil
@@ -347,34 +361,61 @@ func (dc *DBConnection) readPostgresIndexes(tableName string) ([]Index, error) {
 
 func (dc *DBConnection) readPostgresForeignKeys(tableName string) ([]ForeignKey, error) {
 	rows, err := dc.DB.Query(`
-		SELECT tc.constraint_name, kcu.column_name, ccu.table_name, ccu.column_name, tc.delete_rule, tc.update_rule
+		SELECT tc.constraint_name, kcu.column_name, ccu.table_name, ccu.column_name,
+		       rc.delete_rule, rc.update_rule
 		FROM information_schema.table_constraints tc
 		JOIN information_schema.key_column_usage kcu
-		ON tc.constraint_name = kcu.constraint_name
+			ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
 		JOIN information_schema.constraint_column_usage ccu
-		ON ccu.constraint_name = tc.constraint_name
+			ON ccu.constraint_name = tc.constraint_name
+		JOIN information_schema.referential_constraints rc
+			ON rc.constraint_name = tc.constraint_name AND rc.constraint_schema = tc.table_schema
 		WHERE tc.table_name = ? AND tc.constraint_type = 'FOREIGN KEY'
+		ORDER BY tc.constraint_name, kcu.ordinal_position
 	`, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get foreign keys: %w", err)
 	}
 	defer rows.Close()
 
-	var foreignKeys []ForeignKey
+	fkMap := make(map[string]*ForeignKey)
+	fromSeen := make(map[string]map[string]bool)
+	toSeen := make(map[string]map[string]bool)
+	var fkOrder []string
 	for rows.Next() {
 		var name, fromCol, toTable, toCol, onDelete, onUpdate string
 		if err := rows.Scan(&name, &fromCol, &toTable, &toCol, &onDelete, &onUpdate); err != nil {
 			return nil, fmt.Errorf("failed to scan foreign key: %w", err)
 		}
 
-		foreignKeys = append(foreignKeys, ForeignKey{
-			Name:       name,
-			FromColumn: fromCol,
-			ToTable:    toTable,
-			ToColumn:   toCol,
-			OnDelete:   onDelete,
-			OnUpdate:   onUpdate,
-		})
+		fk, ok := fkMap[name]
+		if !ok {
+			fk = &ForeignKey{
+				Name:       name,
+				FromColumn: fromCol,
+				ToTable:    toTable,
+				ToColumn:   toCol,
+				OnDelete:   onDelete,
+				OnUpdate:   onUpdate,
+			}
+			fkMap[name] = fk
+			fromSeen[name] = make(map[string]bool)
+			toSeen[name] = make(map[string]bool)
+			fkOrder = append(fkOrder, name)
+		}
+		if !fromSeen[name][fromCol] {
+			fromSeen[name][fromCol] = true
+			fk.FromColumns = append(fk.FromColumns, fromCol)
+		}
+		if !toSeen[name][toCol] {
+			toSeen[name][toCol] = true
+			fk.ToColumns = append(fk.ToColumns, toCol)
+		}
+	}
+
+	foreignKeys := make([]ForeignKey, 0, len(fkOrder))
+	for _, name := range fkOrder {
+		foreignKeys = append(foreignKeys, *fkMap[name])
 	}
 
 	return foreignKeys, nil
@@ -423,11 +464,16 @@ func (dc *DBConnection) readSQLiteTable(tableName string) (Table, error) {
 		return Table{}, err
 	}
 
+	foreignKeys, err := dc.readSQLiteForeignKeys(tableName)
+	if err != nil {
+		return Table{}, err
+	}
+
 	return Table{
 		Name:        tableName,
 		Columns:     columns,
 		Indexes:     indexes,
-		ForeignKeys: []ForeignKey{},
+		ForeignKeys: foreignKeys,
 	}, nil
 }
 
@@ -466,17 +512,31 @@ func (dc *DBConnection) readSQLiteIndexes(tableName string) ([]Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get indexes: %w", err)
 	}
-	defer rows.Close()
 
-	var indexes []Index
+	type sqliteIndexInfo struct {
+		name   string
+		unique bool
+	}
+	var indexInfos []sqliteIndexInfo
 	for rows.Next() {
-		var seq, name string
-		var unique int
-		if err := rows.Scan(&seq, &name, &unique); err != nil {
+		// PRAGMA index_list 返回：seq, name, unique, origin, partial（新版 SQLite 共 5 列）
+		var seq, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("failed to scan index: %w", err)
 		}
+		// sqlite_autoindex_* 是 UNIQUE/主键约束隐式创建的索引，不能手动创建或删除，跳过
+		if strings.HasPrefix(name, "sqlite_autoindex_") {
+			continue
+		}
+		indexInfos = append(indexInfos, sqliteIndexInfo{name: name, unique: unique != 0})
+	}
+	rows.Close()
 
-		idxRows, err := dc.DB.Query(fmt.Sprintf("PRAGMA index_info(%s)", name))
+	var indexes []Index
+	for _, info := range indexInfos {
+		idxRows, err := dc.DB.Query(fmt.Sprintf("PRAGMA index_info(%s)", info.name))
 		if err != nil {
 			return nil, fmt.Errorf("failed to get index info: %w", err)
 		}
@@ -494,11 +554,53 @@ func (dc *DBConnection) readSQLiteIndexes(tableName string) ([]Index, error) {
 		idxRows.Close()
 
 		indexes = append(indexes, Index{
-			Name:    name,
-			Unique:  unique != 0,
+			Name:    info.name,
+			Unique:  info.unique,
 			Columns: columns,
 		})
 	}
 
 	return indexes, nil
+}
+
+func (dc *DBConnection) readSQLiteForeignKeys(tableName string) ([]ForeignKey, error) {
+	rows, err := dc.DB.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", tableName))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get foreign keys: %w", err)
+	}
+	defer rows.Close()
+
+	fkMap := make(map[int]*ForeignKey)
+	var fkOrder []int
+	for rows.Next() {
+		var id, seq int
+		var toTable, fromCol, toCol string
+		var onUpdate, onDelete, match sql.NullString
+		if err := rows.Scan(&id, &seq, &toTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
+			return nil, fmt.Errorf("failed to scan foreign key: %w", err)
+		}
+
+		fk, ok := fkMap[id]
+		if !ok {
+			fk = &ForeignKey{
+				Name:       fmt.Sprintf("fk_%s_%d", tableName, id),
+				FromColumn: fromCol,
+				ToTable:    toTable,
+				ToColumn:   toCol,
+				OnDelete:   onDelete.String,
+				OnUpdate:   onUpdate.String,
+			}
+			fkMap[id] = fk
+			fkOrder = append(fkOrder, id)
+		}
+		fk.FromColumns = append(fk.FromColumns, fromCol)
+		fk.ToColumns = append(fk.ToColumns, toCol)
+	}
+
+	foreignKeys := make([]ForeignKey, 0, len(fkOrder))
+	for _, id := range fkOrder {
+		foreignKeys = append(foreignKeys, *fkMap[id])
+	}
+
+	return foreignKeys, nil
 }
